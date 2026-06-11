@@ -1028,7 +1028,7 @@ class SettlementMixin:
             except Exception as e:
                 logger.warning(f"{log_prefix} 结算TWAP: 仓位验证异常 {e}，以本地记录为准")
             state._settlement_twap_qty_snapshot = _total_qty
-            _slices = max(int(getattr(self, 'settlement_twap_slices', 10)), 2)
+            _slices = max(int(getattr(self, 'settlement_twap_slices', 30)), 2)
             _twap_minutes = max(float(getattr(self, 'settlement_twap_minutes', 30)), 5)
             _interval_sec = (_twap_minutes * 60) / _slices
 
