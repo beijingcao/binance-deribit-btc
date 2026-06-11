@@ -127,7 +127,7 @@ class RealTimeArbitrageEngineCore:
         self.binance_close_twap_interval_sec = 0.25
         self.settlement_twap_enabled = True
         self.settlement_twap_minutes = 30
-        self.settlement_twap_slices = 10
+        self.settlement_twap_slices = 30
         self.basis_monitor_hours = 3.0
         self.basis_early_trigger_usd = 300.0
         self.basis_deterioration_trigger_usd = 150.0
