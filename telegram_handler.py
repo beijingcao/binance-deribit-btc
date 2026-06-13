@@ -310,6 +310,23 @@ class TelegramNotifier:
             self.engine._remove_pause("手动stop")
             self.engine._remove_pause("紧急清仓")
             self.engine._remove_pause("Binance对冲临时失败")
+            # 🌟 2026-06-11: 持仓数据可疑暂停 = 等待人工核实, /start 即操作员确认
+            # 确认后 15 分钟内空仓读数视同因果证据 (防"外部平仓无事件"场景死锁)
+            # CR-3: 回看窗口覆盖"/start 处理中途暂停被竞态移除"场景;
+            # R4-1: 暂停若已被数据恢复 auto-resolve (last_add <= auto_resolved), 惯性
+            # /start 不再登记 ack — 数据已自证恢复时不应开 15 分钟放行窗口
+            _last_add_ts = getattr(self.engine, '_bn_suspect_last_add_ts', 0.0)
+            _auto_resolved_ts = getattr(self.engine, '_bn_suspect_auto_resolved_ts', 0.0)
+            _suspect_recent = (
+                self.engine._has_pause("Binance持仓数据可疑")
+                or ((time.time() - _last_add_ts) < 120 and _last_add_ts > _auto_resolved_ts))
+            if _suspect_recent:
+                self.engine._bn_suspect_human_ack_ts = time.time()
+                await self.send_async(
+                    "⚠️ 已登记 Binance 持仓数据人工确认 — 15 分钟内系统将信任\"空仓\"读数, "
+                    "可能据此平掉无对冲的期权腿。\n"
+                    "请确保你已在 Binance 核实实仓确实为空; 若未核实, 请立即 /stop。")
+            self.engine._remove_pause("Binance持仓数据可疑")
             self.engine._manual_stop = False
             self.engine.trade_executor.emergency_stop = False
             self.engine.trade_executor._stop_signal_logged = False

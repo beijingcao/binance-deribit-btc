@@ -319,6 +319,19 @@ class BinanceFuturesWSClient:
         self._user_reconnect_lock = asyncio.Lock()
         self.market_connected_at: float = 0.0
         self.on_market_disconnect: Optional[Callable[[str], None]] = None
+        # 🌟 2026-06-11 幻影空仓事故修复: 持仓数据可信度追踪
+        # user_data_ready_at: 用户数据流就绪时刻 (重连后重置)
+        # position_snapshot_ok/at: 初始持仓快照是否成功 + 时刻
+        # position_zero_events: 交易所主动推送的持仓归零事件 (ACCOUNT_UPDATE),
+        #   是"持仓真的没了"的因果证据 — 区别于 REST 假空读数
+        self.user_data_ready_at: float = 0.0
+        self.position_snapshot_ok: bool = False
+        self.position_snapshot_at: float = 0.0
+        self._initial_snapshot_in_progress: bool = False
+        self.position_zero_events: Dict[Tuple[str, str], float] = {}
+        # ORDER_TRADE_UPDATE 推送的成交均价缓存 (orderId -> avgPrice),
+        # 用于测试网 MARKET 单响应 avgPrice=0 时的零成本回填
+        self.order_avg_prices: Dict[str, Decimal] = {}
 
         # 订阅的 symbol 列表
         self._subscribed_symbols: List[str] = []
@@ -688,6 +701,7 @@ class BinanceFuturesWSClient:
                 close_timeout=5,
             )
             self._connected_user.set()
+            self.user_data_ready_at = time.time()
             logger.info("[Binance WS] 用户数据 WebSocket 已连接")
         except Exception as e:
             logger.error(f"[Binance WS] 用户数据连接失败: {e}")
@@ -776,6 +790,17 @@ class BinanceFuturesWSClient:
             "reduce_only": order_info.get("R", False),
             "position_side": order_info.get("ps", "BOTH"),
         }
+        # 🌟 均价缓存: ORDER_TRADE_UPDATE 的 ap 字段通常比 REST 响应更早拿到真实均价
+        # (测试网 MARKET/RESULT 响应常返回 avgPrice=0)，供 _backfill_avg_price 零成本回填
+        try:
+            if update["avg_price"] > 0 and update["order_id"]:
+                self.order_avg_prices[str(update["order_id"])] = update["avg_price"]
+                if len(self.order_avg_prices) > 500:
+                    for _stale_oid in list(self.order_avg_prices.keys())[:250]:
+                        self.order_avg_prices.pop(_stale_oid, None)
+        except Exception:
+            pass
+
         try:
             self._order_updates.put_nowait(update)
         except asyncio.QueueFull:
@@ -816,6 +841,8 @@ class BinanceFuturesWSClient:
                     key = (symbol, pos_side)
                     if pos_amt == 0:
                         self.positions_by_side.pop(key, None)
+                        # 🌟 因果证据: 交易所主动推送的归零事件 (强平/ADL/外部平仓都会推)
+                        self.position_zero_events[key] = time.time()
                         logger.debug(f"[Binance WS] 持仓清除: {symbol} {pos_side}")
                     else:
                         self.positions_by_side[key] = BinanceFuturesPosition(
@@ -835,6 +862,9 @@ class BinanceFuturesWSClient:
                         self.positions.pop(symbol, None)
                         self.positions_by_side.pop((symbol, "LONG"), None)
                         self.positions_by_side.pop((symbol, "SHORT"), None)
+                        _zero_ts = time.time()
+                        for _zk in ((symbol, "LONG"), (symbol, "SHORT"), (symbol, "BOTH")):
+                            self.position_zero_events[_zk] = _zero_ts
                         logger.debug(f"[Binance WS] 持仓清除: {symbol}")
                     else:
                         side = "LONG" if pos_amt > 0 else "SHORT"
@@ -995,6 +1025,12 @@ class BinanceFuturesWSClient:
         params = {"symbol": symbol}
         result = await self._rest_request("GET", "/fapi/v2/positionRisk", params, signed=True)
         if result and isinstance(result, list):
+            # 🌟 RISK-1 修复: 成功读取即恢复持仓快照可信标记 (同 get_position_risk_all)
+            # API-R2-03: 初始快照循环内跳过 (可信与否由 start() 段尾按全量结果判定)
+            if not self.position_snapshot_ok and not self._initial_snapshot_in_progress:
+                self.position_snapshot_ok = True
+                self.position_snapshot_at = time.time()
+                logger.info("[Binance WS] positionRisk 查询成功, 持仓快照可信标记已恢复 (预热重新计时)")
             candidates = [pos for pos in result if pos.get("symbol") == symbol]
             if not candidates:
                 return None
@@ -1031,6 +1067,13 @@ class BinanceFuturesWSClient:
                     rows.append(pos)
         elif result and isinstance(result, dict) and result.get("symbol") == symbol:
             rows.append(result)
+        # 🌟 RISK-1 修复: 启动快照失败后, 任意一次成功的 positionRisk 读取即恢复可信标记
+        # (一次性恢复 + 预热重新计时; ok=True 后不再刷新, 防止预热时钟被每次读取重置)
+        # API-R2-03: 初始快照循环内跳过 (可信与否由 start() 段尾按全量结果判定)
+        if not self.position_snapshot_ok and not self._initial_snapshot_in_progress:
+            self.position_snapshot_ok = True
+            self.position_snapshot_at = time.time()
+            logger.info("[Binance WS] positionRisk 查询成功, 持仓快照可信标记已恢复 (预热重新计时)")
         return rows
 
     async def get_account_info(self) -> Optional[dict]:
@@ -1210,10 +1253,16 @@ class BinanceFuturesWSClient:
             logger.warning(f"[Binance WS] 持仓模式查询失败: {e}")
 
         # ===== 通过 REST 拉取初始持仓快照（WS 只推增量，不含历史持仓）=====
+        # 🌟 2026-06-11 修复: 记录快照成功/失败状态, 供上层判断"空仓读数"可信度
+        self.position_snapshot_ok = False
+        self.position_snapshot_at = 0.0
+        self._initial_snapshot_in_progress = True
+        _snapshot_all_ok = True
         try:
             for sym in symbols:
                 risks = await self.get_position_risk_all(sym)
                 if risks is None:
+                    _snapshot_all_ok = False
                     logger.warning(f"[Binance WS] 初始持仓查询失败（状态未知）: {sym}，等待后续WS/REST同步")
                     continue
                 for risk in risks:
@@ -1246,12 +1295,25 @@ class BinanceFuturesWSClient:
                         logger.info(f"[Binance WS] 初始持仓加载: {sym} {side} 数量={abs(pos_amt)} 入场价={risk.get('entryPrice')}")
                 if self.positions_by_side.get((sym, "LONG")) or self.positions_by_side.get((sym, "SHORT")):
                     self._rebuild_net_position(sym)
-            if self.positions:
-                logger.info(f"[Binance WS] 初始持仓加载完成: {len(self.positions)} 个合约")
+            self._initial_snapshot_in_progress = False
+            if _snapshot_all_ok:
+                self.position_snapshot_ok = True
+                self.position_snapshot_at = time.time()
+            _has_any_pos = bool(self.positions) or any(
+                p.quantity > 0 for p in self.positions_by_side.values())
+            if _has_any_pos:
+                logger.info(
+                    f"[Binance WS] 初始持仓加载完成: net={len(self.positions)}, "
+                    f"分腿={len(self.positions_by_side)}")
             else:
-                logger.info("[Binance WS] 当前无持仓")
+                # ⚠️ 空仓快照可能是测试网/API 状态不一致的假空 (2026-06-11 事故),
+                # 引擎侧依据 position_snapshot_ok + 因果证据决定是否采信
+                logger.info("[Binance WS] 当前无持仓 (快照成功=%s)" % _snapshot_all_ok)
         except Exception as e:
             logger.warning(f"[Binance WS] 初始持仓加载失败（不影响运行）: {e}")
+        finally:
+            # 异常路径也必须复位, 否则运行期恢复通道 (RISK-1a) 被永久关闭
+            self._initial_snapshot_in_progress = False
 
     async def close(self):
         """清理关闭：断开 WS、取消任务、关闭 HTTP 会话"""
@@ -1480,17 +1542,31 @@ class BinanceFuturesExecutor:
                 logger.warning(
                     f"[对账] ✅ 推断下单已成交 (实际仓位与预期 delta 吻合), "
                     f"构造伪成功返回")
-                # 构造伪成功 dict, 让上层流程继续走成功路径
-                return {
+                # 🌟 A4-2: 伪成功 dict 的 avgPrice='0' 会污染上层加权均价 (开仓追单分母/
+                # 平仓 VWAP), 用标记价/盘口估算并打 mark_fallback 标记, 让既有消费链识别为估算价
+                _recon_avg = Decimal('0')
+                _mk = self.mark_prices.get(symbol, Decimal('0'))
+                if _mk and _mk > 0:
+                    _recon_avg = _mk
+                else:
+                    _ob = self.order_books.get(symbol)
+                    if _ob and _ob.mid_price and _ob.mid_price > 0:
+                        _recon_avg = Decimal(str(_ob.mid_price))
+                _recon = {
                     "_reconciled_uncertain": True,
                     "clientOrderId": client_oid,
                     "symbol": symbol,
                     "status": "FILLED",
                     "executedQty": str(expected_qty),
                     "origQty": str(expected_qty),
-                    "avgPrice": "0",  # 均价未知, 让上层降级处理
+                    "avgPrice": str(_recon_avg),
                     "side": expected_side.upper(),
                 }
+                if _recon_avg > 0:
+                    _recon["avgPriceSource"] = "mark_fallback"
+                else:
+                    logger.warning(f"[对账] 伪成功 dict 无标记价/盘口可估, avgPrice 保留 0")
+                return _recon
             elif abs(_delta) <= _tol:
                 logger.warning(
                     f"[对账] ⭕ 实际仓位与本地吻合, 判定下单真失败, 返回 None 让上层重试")
@@ -1582,6 +1658,74 @@ class BinanceFuturesExecutor:
             return qty
         return (qty / step_size).quantize(Decimal('1'), rounding=ROUND_DOWN) * step_size
 
+    async def _backfill_avg_price(self, result: Optional[dict], symbol: str,
+                                  max_requery: int = 1) -> Optional[dict]:
+        """成交回报均价缺失时回填 (测试网 MARKET/RESULT 响应常返回 avgPrice=0)。
+
+        回填链: cumQuote 推算 → WS ORDER_TRADE_UPDATE 缓存 → REST 查单 → 标记价兜底(打标)。
+        标记价兜底会写 result['avgPriceSource']='mark_fallback'，PnL 路径须识别为估算价。
+        纯只读操作，不下单；max_requery 控制 REST 重查次数 (紧急路径保持1次防拖慢分片)。
+        """
+        try:
+            if not result:
+                return result
+            _status = str(result.get('status', '')).upper()
+            _exec_qty = Decimal(str(result.get('executedQty', '0') or '0'))
+            _avg = Decimal(str(result.get('avgPrice', '0') or '0'))
+            # EXPIRED = IOC 部分成交后剩余被取消, executedQty>0 时同样需要回填均价
+            if _status not in ('FILLED', 'PARTIALLY_FILLED', 'EXPIRED') or _exec_qty <= 0 or _avg > 0:
+                return result
+            _cq = Decimal(str(result.get('cumQuote', '0') or '0'))
+            if _cq > 0:
+                result['avgPrice'] = str(_cq / _exec_qty)
+                result['avgPriceSource'] = 'cum_quote'
+                return result
+            _oid = str(result.get('orderId', '') or '')
+            for _i in range(max(1, max_requery)):
+                if _oid:
+                    _cached = self.ws_client.order_avg_prices.get(_oid, Decimal('0'))
+                    if _cached > 0:
+                        result['avgPrice'] = str(_cached)
+                        result['avgPriceSource'] = 'ws_cache'
+                        return result
+                await asyncio.sleep(0.25 * (_i + 1))
+                if _oid:
+                    try:
+                        _q = await self.ws_client._rest_request(
+                            "GET", "/fapi/v1/order",
+                            {"symbol": symbol, "orderId": _oid}, signed=True)
+                        if isinstance(_q, dict) and _q.get('code') is None:
+                            _qa = Decimal(str(_q.get('avgPrice', '0') or '0'))
+                            _qcq = Decimal(str(_q.get('cumQuote', '0') or '0'))
+                            _qz = Decimal(str(_q.get('executedQty', '0') or '0'))
+                            if _qa > 0:
+                                result['avgPrice'] = str(_qa)
+                                result['avgPriceSource'] = 'rest_requery'
+                                return result
+                            if _qcq > 0 and _qz > 0:
+                                result['avgPrice'] = str(_qcq / _qz)
+                                result['avgPriceSource'] = 'rest_cum_quote'
+                                return result
+                    except Exception:
+                        pass
+            _mark = self.ws_client.mark_prices.get(symbol, Decimal('0'))
+            if _mark <= 0:
+                _ob = self.ws_client.order_books.get(symbol)
+                if _ob and _ob.mid_price and _ob.mid_price > 0:
+                    _mark = Decimal(str(_ob.mid_price))
+            if _mark > 0:
+                result['avgPrice'] = str(_mark)
+                result['avgPriceSource'] = 'mark_fallback'
+                logger.warning(
+                    f"[Binance执行器] {symbol} orderId={_oid} 均价回填失败, "
+                    f"以标记价 {_mark} 估算并打标 (avgPriceSource=mark_fallback)")
+            else:
+                logger.warning(f"[Binance执行器] {symbol} orderId={_oid} 均价回填失败且无标记价可用")
+            return result
+        except Exception as _bf_err:
+            logger.warning(f"[Binance执行器] 均价回填异常 (忽略, 保留原回报): {_bf_err}")
+            return result
+
     async def place_market_order(self, symbol: str, side: str, quantity: Decimal,
                                   reduce_only: bool = False, position_side: Optional[str] = None) -> Optional[dict]:
         """下市价单
@@ -1626,10 +1770,14 @@ class BinanceFuturesExecutor:
 
         result = await self.ws_client._rest_request("POST", "/fapi/v1/order", params, signed=True)
         if result and 'orderId' in result:
+            # 🌟 2026-06-11 修复: 测试网常返回 FILLED+avgPrice=0, 回填真实均价防污染 PnL
+            result = await self._backfill_avg_price(result, symbol)
             order_id = result.get("orderId", "")
             status = result.get("status", "")
             avg_price = result.get("avgPrice", "0")
-            logger.info(f"[Binance执行器] 市价单结果: orderId={order_id} 状态={status} 均价={avg_price}")
+            _avg_src = result.get("avgPriceSource", "")
+            logger.info(f"[Binance执行器] 市价单结果: orderId={order_id} 状态={status} "
+                        f"均价={avg_price}{f' (来源:{_avg_src})' if _avg_src else ''}")
             return result
         else:
             err_code = result.get('code', '') if result else ''
@@ -1660,7 +1808,8 @@ class BinanceFuturesExecutor:
                             f"[Binance执行器] 🚨 -5022 查单结果校验失败 (疑似 client_oid 碰撞), "
                             f"判本次下单失败; 交给上层重试或对账")
                         return None
-                    return _query_result
+                    # 🌟 API-R2-02: 查单恢复的订单同样可能 avgPrice=0, 走回填链
+                    return await self._backfill_avg_price(_query_result, symbol)
             self._last_order_error = int(err_code) if str(err_code).lstrip('-').isdigit() else None
             logger.error(f"[Binance执行器] 市价单失败: {err_code} {err_msg}")
             return None
@@ -1713,6 +1862,8 @@ class BinanceFuturesExecutor:
 
         result = await self.ws_client._rest_request("POST", "/fapi/v1/order", params, signed=True)
         if result and 'orderId' in result:
+            # 🌟 2026-06-11 修复: 均价缺失回填 (同 place_market_order)
+            result = await self._backfill_avg_price(result, symbol)
             order_id = result.get("orderId", "")
             status = result.get("status", "")
             filled = result.get("executedQty", "0")
@@ -1740,7 +1891,8 @@ class BinanceFuturesExecutor:
                             f"[Binance执行器] 🚨 IOC -5022 查单结果校验失败 (疑似 client_oid 碰撞), "
                             f"判本次下单失败; 交给上层重试")
                         return None
-                    return _query_result
+                    # 🌟 A4-1: 与 market 路径对齐, 查单恢复结果同样过均价回填链
+                    return await self._backfill_avg_price(_query_result, symbol)
         return result
 
     async def cancel_order(self, symbol: str, order_id: int) -> Optional[dict]:
@@ -1866,19 +2018,30 @@ class BinanceFuturesExecutor:
                 merged["executedQty"] = str(total_filled)
                 merged["origQty"] = str(_target)
                 merged["status"] = "FILLED" if total_filled + _tol >= _target else "PARTIALLY_FILLED"
-                if total_quote > 0:
-                    merged["cumQuote"] = str(total_quote)
-                    merged["cummulativeQuoteQty"] = str(total_quote)
-                    merged["avgPrice"] = str(total_quote / total_filled)
+                # 🌟 API-R2-01 修复: 单腿 cumQuote 缺失时不得用总成交量稀释均价 —
+                # 每腿有效报价额 = cumQuote 优先, 缺失用该腿 avgPrice×成交量推算;
+                # 仍无价的腿不计入定价分母 (与结算 TWAP 的 priced-denominator 同思路)
+                p_avg = _to_dec(primary.get("avgPrice", "0"))
+                f_avg = _to_dec(fallback.get("avgPrice", "0")) if fallback else Decimal("0")
+                p_q_eff = p_quote if p_quote > 0 else (p_avg * p_filled if p_avg > 0 else Decimal("0"))
+                f_q_eff = f_quote if f_quote > 0 else (f_avg * f_filled if f_avg > 0 else Decimal("0"))
+                _priced_filled = ((p_filled if p_q_eff > 0 else Decimal("0"))
+                                  + (f_filled if f_q_eff > 0 else Decimal("0")))
+                if _priced_filled > 0:
+                    merged["avgPrice"] = str((p_q_eff + f_q_eff) / _priced_filled)
+                # 🌟 A4-4: cumQuote 与 avgPrice 同口径 (含 avgPrice 推算的有效报价额),
+                # 防下游 cumQuote/executedQty 推算得稀释价
+                if (p_q_eff + f_q_eff) > 0:
+                    merged["cumQuote"] = str(p_q_eff + f_q_eff)
+                    merged["cummulativeQuoteQty"] = str(p_q_eff + f_q_eff)
+                # 估算标记 (API-3/API-R2-05): 任一参与定价的腿为 mark_fallback 即保留标记,
+                # 两腿均为真实价才清除
+                _p_est = primary.get("avgPriceSource") == "mark_fallback" and p_q_eff > 0
+                _f_est = bool(fallback) and (fallback or {}).get("avgPriceSource") == "mark_fallback" and f_q_eff > 0
+                if _p_est or _f_est:
+                    merged["avgPriceSource"] = "mark_fallback"
                 else:
-                    p_avg = _to_dec(primary.get("avgPrice", "0"))
-                    f_avg = _to_dec(fallback.get("avgPrice", "0")) if fallback else Decimal("0")
-                    if p_avg <= 0 and p_filled > 0 and p_quote > 0:
-                        p_avg = p_quote / p_filled
-                    if f_avg <= 0 and f_filled > 0 and f_quote > 0:
-                        f_avg = f_quote / f_filled
-                    _wavg = ((p_avg * p_filled) + (f_avg * f_filled)) / total_filled if total_filled > 0 else Decimal("0")
-                    merged["avgPrice"] = str(_wavg)
+                    merged.pop("avgPriceSource", None)
                 if fallback and f_filled > 0 and fallback.get("orderId"):
                     merged["orderId"] = fallback.get("orderId")
                 logger.info(

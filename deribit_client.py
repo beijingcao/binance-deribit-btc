@@ -95,6 +95,10 @@ class EnhancedDeribitWebSocketClient:
         self.maintenance_sleep_active = False
         self._maintenance_notified = False
         self._maintenance_cooldown_task = None
+        # 🌟 2026-06-11: 下单失败日志节流 + 最近错误记录 (供开仓冷却分类) + 疑似维护滑窗
+        self._order_error_log_ts: Dict[str, float] = {}
+        self.recent_order_errors: Dict[str, Tuple[float, str]] = {}
+        self._suspect_maintenance_events: List[Tuple[float, str]] = []
 
     def _store_order_snapshot(self, order: Order) -> None:
         """Store an order in the right local cache according to its current state."""
@@ -136,6 +140,9 @@ class EnhancedDeribitWebSocketClient:
             existing.price if existing else None)
         filled_default = existing.filled_amount if existing else Decimal('0')
         avg_default = existing.average_price if existing else Decimal('0')
+        _ro_raw = order_data.get('reduce_only')
+        reduce_only_val = bool(_ro_raw) if _ro_raw is not None else (
+            existing.reduce_only if existing else False)
         return Order(
             order_id=order_id,
             instrument_name=order_data.get('instrument_name') or (existing.instrument_name if existing else ''),
@@ -147,7 +154,8 @@ class EnhancedDeribitWebSocketClient:
             status=order_data.get('order_state') or (existing.status if existing else 'open'),
             timestamp=existing.timestamp if existing else time.time(),
             filled_amount=_dec_or(order_data.get('filled_amount'), filled_default),
-            average_price=_dec_or(order_data.get('average_price'), avg_default)
+            average_price=_dec_or(order_data.get('average_price'), avg_default),
+            reduce_only=reduce_only_val
         )
 
 
@@ -806,7 +814,11 @@ class EnhancedDeribitWebSocketClient:
             orders = []
             for item in response.get('result', []):
                 try:
-                    order = self._order_from_api_data(item)
+                    # 🌟 2026-06-11 事故修复: 必须传 existing — close_position 创建的订单
+                    # 在交易所侧无 label, 不传 existing 会用空 label 覆盖本地 'em_close' 标记,
+                    # 导致 _find_active_deribit_close_order 失配 → invalid_reduce_only_order 死循环
+                    order = self._order_from_api_data(
+                        item, existing=self.active_orders.get(item.get('order_id') or ''))
                     orders.append(order)
                     self._store_order_snapshot(order)
                 except Exception as e:
@@ -873,9 +885,28 @@ class EnhancedDeribitWebSocketClient:
 
     @staticmethod
     def _get_dynamic_tick(price: Decimal, _inst_info: dict = None) -> Decimal:
-        """Deribit BTC/ETH 期权分档 tick（固定两档规则，2023年7月官方确认）。
-        价格 ≤0.005 → 0.0001，价格 >0.005 → 0.0005。
-        inst_info 参数保留兼容性，不再使用（API 不返回 tick_size_steps）。"""
+        """Deribit BTC/ETH 期权分档 tick。
+
+        优先解析 API 返回的 tick_size_steps (实测 get_instrument(s) 均含该字段,
+        当前为 [{'tick_size': 0.0005, 'above_price': 0.005}] + tick_size=0.0001),
+        交易所未来调档时自动适配; 解析失败回落硬编码两档 (与现行官方规则一致):
+        价格 ≤0.005 → 0.0001，价格 >0.005 → 0.0005。"""
+        try:
+            if _inst_info:
+                _steps = _inst_info.get('tick_size_steps') or []
+                _base_tick = Decimal(str(_inst_info.get('tick_size', '0.0001')))
+                if _steps:
+                    # 按 above_price 降序找首个 price > above_price 的档位
+                    _parsed = sorted(
+                        ((Decimal(str(s.get('above_price'))), Decimal(str(s.get('tick_size'))))
+                         for s in _steps if s.get('above_price') is not None and s.get('tick_size')),
+                        key=lambda x: x[0], reverse=True)
+                    for _above, _tick in _parsed:
+                        if price > _above:
+                            return _tick
+                    return _base_tick
+        except Exception:
+            pass
         if price <= Decimal('0.005'):
             return Decimal('0.0001')
         else:
@@ -1005,14 +1036,45 @@ class EnhancedDeribitWebSocketClient:
 
             if 'error' in response:
                 error_msg = str(response['error'].get('message', '未知错误'))
+                error_code = response['error'].get('code', '')
                 error_data = response['error'].get('data', {})
-                # 🌟 核心修复：提取隐藏的真实原因
+                # 🌟 核心修复：提取隐藏的真实原因 (2026-06-11: 补记数字错误码, 便于区分子原因)
                 real_reason = error_data.get('reason', '')
-                full_error = f"{error_msg} | {real_reason}"
+                full_error = f"{error_msg} | {real_reason} | code={error_code}"
+
+                # 🌟 2026-06-11: 记录最近错误供开仓冷却分类 (交易所拒单 vs 良性撤单)
+                _err_key_short = (real_reason or error_msg or 'unknown')[:60]
+                self.recent_order_errors[instrument_name] = (time.time(), _err_key_short)
+                if len(self.recent_order_errors) > 200:
+                    _cutoff = time.time() - 600
+                    self.recent_order_errors = {
+                        k: v for k, v in self.recent_order_errors.items() if v[0] >= _cutoff}
+
+                # 🌟 2026-06-11: 同 (合约,方向,错误) 60s 节流, 防止重试循环 ERROR 刷屏
+                # (2.5小时 359 条 invalid_reduce_only_order 事故)。首条必发;
+                # 注意: 下方保证金/维护副作用分支不受节流影响, 必须无条件执行。
+                _log_key = f"{instrument_name}:{side}:{_err_key_short}"
+                _now_err = time.time()
+                _last_err_log = self._order_error_log_ts.get(_log_key, 0.0)
+                _should_log_error = (_now_err - _last_err_log) >= 60.0
+                if _should_log_error:
+                    self._order_error_log_ts[_log_key] = _now_err
+                    if len(self._order_error_log_ts) > 300:
+                        _cutoff2 = _now_err - 3600
+                        self._order_error_log_ts = {
+                            k: v for k, v in self._order_error_log_ts.items() if v >= _cutoff2}
+                _maint_probe_reject = (
+                    ('locked_by_admin' in full_error.lower() or 'maintenance' in full_error.lower())
+                    and getattr(self, 'maintenance_sleep_active', False))
                 if 'settlement_in_progress' in full_error.lower():
                     logger.warning(f"{prefix}下单失败: {full_error}")
-                else:
+                elif _maint_probe_reject:
+                    # 维护休眠期间的真实订单探测被拒是预期结果 (说明维护未结束), 降级 warning
+                    logger.warning(f"{prefix}下单失败(维护探测): {full_error}")
+                elif _should_log_error:
                     logger.error(f"{prefix}下单失败: {full_error}")
+                else:
+                    logger.debug(f"{prefix}下单失败(节流重复): {full_error}")
 
                 # ================= 🌟 保证金不足：暂停开仓，保留平仓监控 =================
                 if 'not_enough_funds' in full_error.lower() or 'insufficient' in full_error.lower():
@@ -1021,7 +1083,33 @@ class EnhancedDeribitWebSocketClient:
                             "Deribit", f"下单被拒: {full_error}"))
 
                 # ================= 🌟 终极修复：真实订单 5 分钟休眠探测法 =================
-                if 'locked_by_admin' in full_error.lower() or 'maintenance' in full_error.lower():
+                _is_maintenance_error = (
+                    'locked_by_admin' in full_error.lower() or 'maintenance' in full_error.lower())
+
+                # 🌟 2026-06-11: invalid_args_for_instrument 疑似维护检测
+                # 事故证据: 测试网维护准备/扫尾期对锁定合约返回 invalid_args_for_instrument
+                # (同一订单在维护深度期返回 locked_by_admin, 参数实测完全合规)。
+                # 判据: 120s 内 ≥3 次且涉及 ≥2 个不同合约 → 按维护处理 (5分钟休眠探测)。
+                # ⚠️ 误判代价 (RISK-4, 与真实维护的既有行为一致): 维护暂停会使
+                # monitor_positions 整体跳过巡检 (含硬止损/Gamma), 且恢复探针的
+                # cancel_all 会撤掉在途平仓挂单 (由破损组合重试循环+60s 重发兜底);
+                # probe 成功后 ~5 分钟自动解除, 比 45s 无告警重试风暴更安全。
+                if not _is_maintenance_error and 'invalid_args_for_instrument' in full_error.lower():
+                    _now_sm = time.time()
+                    self._suspect_maintenance_events.append((_now_sm, instrument_name))
+                    self._suspect_maintenance_events = [
+                        (t, inst) for t, inst in self._suspect_maintenance_events
+                        if _now_sm - t <= 120.0]
+                    _distinct_insts = {inst for _, inst in self._suspect_maintenance_events}
+                    if len(self._suspect_maintenance_events) >= 3 and len(_distinct_insts) >= 2:
+                        logger.error(
+                            f"{prefix}🚨 [疑似维护] invalid_args_for_instrument 120s内 "
+                            f"{len(self._suspect_maintenance_events)} 次/涉及 {len(_distinct_insts)} 个合约, "
+                            f"按交易所维护降级处理")
+                        _is_maintenance_error = True
+                        self._suspect_maintenance_events = []
+
+                if _is_maintenance_error:
                     if tg_notifier.engine:
                         if not getattr(self, 'maintenance_sleep_active', False):
                             self.maintenance_sleep_active = True
